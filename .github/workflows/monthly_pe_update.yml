@@ -1,0 +1,61 @@
+name: Nifty 50 Monthly P/E Update
+
+on:
+  # ── Scheduled trigger: 1st of every month at 06:00 UTC (11:30 IST) ──
+  schedule:
+    - cron: "0 6 1 * *"
+
+  # ── Manual trigger for backfill / debugging ──
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (skip DB write)"
+        required: false
+        default: "false"
+        type: boolean
+
+jobs:
+  fetch-and-store:
+    name: Fetch Nifty 50 P/E & Upsert to Supabase
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── 3. Install dependencies ──────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Run the fetch script ──────────────────────────────────────────────
+      - name: Fetch & upsert Nifty 50 P/E
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DRY_RUN:      ${{ github.event.inputs.dry_run || 'false' }}
+        run: python fetch_nifty_pe.py
+
+      # ── 5. Notify on failure ─────────────────────────────────────────────────
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[Alert] Nifty 50 P/E fetch failed — ${new Date().toISOString().slice(0,10)}`,
+              body:  `The monthly P/E fetch workflow failed.\n\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`,
+              labels: ["bug", "data-pipeline"]
+            });
