@@ -3,7 +3,7 @@ name: Nifty 50 Monthly P/E Update
 on:
   # Scheduled trigger: 1st of every month at 06:00 UTC (11:30 IST)
   schedule:
-    - cron: "0 6 1 * *"
+    - cron: "0 6 2 * *"
 
   # Manual trigger for backfill / debugging
   workflow_dispatch:
