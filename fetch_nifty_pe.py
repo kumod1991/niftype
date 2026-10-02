@@ -833,32 +833,18 @@ def load_historical_pe() -> pd.DataFrame:
 def _nse_session() -> requests.Session:
 
     session = requests.Session()
+    session.headers.update(NSE_HEADERS)
 
-    session.headers.update(
-        NSE_HEADERS
-    )
-
-    warmup_urls = [
-        "https://www.nseindia.com",
-        "https://www.nseindia.com/market-data/live-equity-market",
-    ]
-
-    for url in warmup_urls:
-
-        try:
-
-            session.get(
-                url,
-                timeout=15,
-            )
-
-            time.sleep(1.0)
-
-        except Exception as e:
-
-            log.debug(
-                f"Warm-up failed for {url}: {e}"
-            )
+    # A single short warm-up request is enough. The previous version
+    # performed two 15-second warm-ups, which could make the GitHub Action
+    # appear stuck when NSE was slow or blocking the runner.
+    try:
+        session.get(
+            "https://www.nseindia.com/",
+            timeout=5,
+        )
+    except requests.RequestException as e:
+        log.warning(f"NSE warm-up failed: {e}")
 
     return session
 
@@ -866,44 +852,38 @@ def _nse_session() -> requests.Session:
 def fetch_current_pe() -> tuple[float | None, str]:
 
     """
-    Fetch current-month NIFTY 50 trailing PE from NSE.
+    Fetch the latest NIFTY 50 trailing PE from NSE.
 
-    Returns:
-        (pe, source)
+    This function deliberately has short timeouts so a GitHub Actions runner
+    cannot spend several minutes waiting for NSE. If NSE is unavailable, the
+    caller receives (None, "unavailable") and the final merge safety check
+    will stop the workflow rather than inserting a NULL PE.
     """
 
-    log.info(
-        "Fetching current month PE from NSE allIndices ..."
-    )
+    log.info("Fetching current month PE from NSE allIndices ...")
+
+    session = _nse_session()
 
     try:
-
-        session = _nse_session()
-
         response = session.get(
             "https://www.nseindia.com/api/allIndices",
-            timeout=20,
+            timeout=10,
         )
 
         response.raise_for_status()
 
-        content_type = (
-            response.headers.get(
-                "Content-Type",
-                ""
-            )
+        content_type = response.headers.get(
+            "Content-Type",
+            "",
         )
 
         if (
             "json" not in content_type.lower()
             and "javascript" not in content_type.lower()
         ):
-
             log.warning(
-                f"NSE allIndices returned "
-                f"non-JSON response: {content_type}"
+                f"NSE allIndices returned non-JSON response: {content_type}"
             )
-
             return None, "unavailable"
 
         payload = response.json()
@@ -914,7 +894,7 @@ def fetch_current_pe() -> tuple[float | None, str]:
                 idx.get("indexSymbol")
                 or idx.get("index")
                 or ""
-            ).upper()
+            ).strip().upper()
 
             if name == "NIFTY 50":
 
@@ -924,29 +904,42 @@ def fetch_current_pe() -> tuple[float | None, str]:
                     or idx.get("PE")
                 )
 
-                if pe is not None:
+                if pe is None:
+                    continue
 
+                try:
                     pe = float(pe)
+                except (TypeError, ValueError):
+                    continue
 
-                    if pe > 0:
-
-                        log.info(
-                            f"  -> NIFTY 50 current PE = {pe}"
-                        )
-
-                        return (
-                            pe,
-                            "nse_live",
-                        )
+                if math.isfinite(pe) and pe > 0:
+                    log.info(
+                        f"  -> NIFTY 50 current PE = {pe}"
+                    )
+                    return pe, "nse_live"
 
         log.warning(
             "NIFTY 50 not found in NSE allIndices response"
         )
 
-    except Exception as e:
-
+    except requests.Timeout as e:
         log.warning(
-            f"NSE allIndices error: {e}"
+            f"NSE allIndices request timed out after 10 seconds: {e}"
+        )
+
+    except requests.RequestException as e:
+        log.warning(
+            f"NSE allIndices request failed: {e}"
+        )
+
+    except ValueError as e:
+        log.warning(
+            f"NSE allIndices returned invalid JSON: {e}"
+        )
+
+    except Exception as e:
+        log.warning(
+            f"Unexpected NSE allIndices error: {e}"
         )
 
     return None, "unavailable"
