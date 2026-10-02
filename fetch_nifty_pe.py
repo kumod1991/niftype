@@ -827,7 +827,93 @@ def load_historical_pe() -> pd.DataFrame:
 
 
 # ============================================================================
-# 3. NSE CURRENT-MONTH PE
+# 3. CURRENT-MONTH MTD PRICE DATA
+# ============================================================================
+
+def fetch_current_month_price() -> pd.DataFrame:
+
+    """
+    Fetch month-to-date NIFTY 50 OHLCV for the current calendar month.
+
+    The monthly yfinance series normally ends at the previous completed
+    month when this workflow runs on the 2nd. Therefore the current month
+    must be created separately.
+
+    The returned row is dated to the first day of the current month.
+    OHLCV is aggregated month-to-date from daily NIFTY data.
+    """
+
+    current_month = (
+        pd.Timestamp.today()
+        .to_period("M")
+        .to_timestamp()
+    )
+
+    log.info(
+        f"Fetching current-month MTD OHLCV for {TICKER} "
+        f"({current_month.strftime('%Y-%m')}) ..."
+    )
+
+    df = yf.Ticker(TICKER).history(
+        period="10d",
+        interval="1d",
+        auto_adjust=True,
+    )
+
+    if df.empty:
+        raise RuntimeError(
+            "yfinance returned empty daily data for current month."
+        )
+
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+
+    df = df.reset_index()
+
+    df = df.rename(
+        columns={
+            "Date": "date",
+            "Open": "open",
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Volume": "volume",
+        }
+    )
+
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+
+    month_df = df[
+        df["date"].dt.to_period("M")
+        == current_month.to_period("M")
+    ].copy()
+
+    if month_df.empty:
+        raise RuntimeError(
+            f"No daily NIFTY 50 price data found for "
+            f"current month {current_month.strftime('%Y-%m')}."
+        )
+
+    # Month-to-date OHLCV.
+    row = pd.DataFrame([{
+        "date": current_month,
+        "open": float(month_df.iloc[0]["open"]),
+        "high": float(month_df["high"].max()),
+        "low": float(month_df["low"].min()),
+        "close": float(month_df.iloc[-1]["close"]),
+        "volume": int(pd.to_numeric(month_df["volume"], errors="coerce").fillna(0).sum()),
+    }])
+
+    log.info(
+        f"  -> Current month row: {current_month.strftime('%Y-%m-%d')} "
+        f"close={row.iloc[0]['close']:.2f}"
+    )
+
+    return row
+
+
+# ============================================================================
+# 4. NSE CURRENT-MONTH PE
 # ============================================================================
 
 def _nse_session() -> requests.Session:
@@ -1081,14 +1167,26 @@ def build_final_dataframe(
         pe_df
         .dropna(subset=["date", "pe_ratio"])
         .sort_values("date")
-        .drop_duplicates(
-            subset=["date"],
-            keep="last",
-        )
+        .drop_duplicates(subset=["date"], keep="last")
     )
 
     # ------------------------------------------------------------------------
-    # Validate historical data BEFORE adding the live/latest-month PE
+    # IMPORTANT ARCHITECTURE
+    # ------------------------------------------------------------------------
+    # The monthly yfinance series contains completed months only. On the 2nd
+    # of a new month, its latest bar is the PREVIOUS month. We therefore do
+    # NOT attach the live PE to price_df's latest month.
+    #
+    # Instead:
+    #   1. Validate historical PE through the previous completed month.
+    #   2. Fetch the CURRENT calendar month's MTD OHLCV separately.
+    #   3. Fetch live NSE PE.
+    #   4. Create a NEW current-month row dated YYYY-MM-01.
+    #
+    # Example:
+    #   2-Oct-2026 -> historical data ends Sep-2026
+    #   current row = 2026-10-01
+    #   live NSE PE -> 2026-10-01
     # ------------------------------------------------------------------------
 
     validate_historical_pe_coverage(
@@ -1096,73 +1194,80 @@ def build_final_dataframe(
         pe_df,
     )
 
-    # ------------------------------------------------------------------------
-    # Latest available price month
-    #
-    # On 2-Oct-2026, yfinance normally gives Sep-2026 as the latest
-    # completed monthly price bar. That is the row whose PE should be
-    # established by the monthly NSE live fetch.
-    # ------------------------------------------------------------------------
-
-    latest_price_month = (
-        price_df["date"]
-        .max()
+    current_month = (
+        pd.Timestamp.today()
         .to_period("M")
         .to_timestamp()
     )
 
     # ------------------------------------------------------------------------
-    # Fetch live NSE PE and assign it to the latest available price month
+    # Fetch current calendar month's MTD price row
+    # ------------------------------------------------------------------------
+
+    current_price_df = fetch_current_month_price()
+
+    # Guard against accidental duplicate current month from yfinance.
+    price_df = price_df[
+        price_df["date"] != current_month
+    ].copy()
+
+    # ------------------------------------------------------------------------
+    # Fetch live NSE PE
     # ------------------------------------------------------------------------
 
     current_pe, current_source = fetch_current_pe()
 
-    if current_pe is not None:
-
-        live_row = pd.DataFrame(
-            [
-                {
-                    "date": latest_price_month,
-                    "pe_ratio": current_pe,
-                    "pe_source": current_source,
-                }
-            ]
+    if current_pe is None:
+        raise RuntimeError(
+            f"Could not fetch live NIFTY 50 PE for current month "
+            f"{current_month.strftime('%Y-%m')}. "
+            "The workflow will not create a NULL current-month PE row."
         )
 
-        # Live NSE value wins for the latest price month.
-        pe_df = pd.concat(
-            [
-                pe_df[pe_df["date"] != latest_price_month],
-                live_row,
-            ],
-            ignore_index=True,
-        )
+    # ------------------------------------------------------------------------
+    # Create current-month PE row separately
+    # ------------------------------------------------------------------------
 
-        pe_df = (
-            pe_df
-            .sort_values("date")
-            .drop_duplicates(
-                subset=["date"],
-                keep="last",
-            )
-            .reset_index(drop=True)
-        )
+    current_pe_row = pd.DataFrame([{
+        "date": current_month,
+        "pe_ratio": current_pe,
+        "pe_source": current_source,
+    }])
 
-        log.info(
-            f"Assigned live NSE PE {current_pe} to latest price month "
-            f"{latest_price_month.strftime('%Y-%m')}"
-        )
+    # Live current-month value wins if a seed/embedded dataset ever contains
+    # the same month.
+    pe_df = pd.concat(
+        [
+            pe_df[pe_df["date"] != current_month],
+            current_pe_row,
+        ],
+        ignore_index=True,
+    )
 
-    else:
+    # ------------------------------------------------------------------------
+    # Add current-month price row to the historical monthly price dataframe
+    # ------------------------------------------------------------------------
 
-        log.warning(
-            "Current/latest-month PE could not be fetched from NSE."
-        )
+    price_df = pd.concat(
+        [
+            price_df,
+            current_price_df,
+        ],
+        ignore_index=True,
+    )
 
-        log.warning(
-            f"No PE will be inserted for {latest_price_month.strftime('%Y-%m')} "
-            "unless it already exists in the historical seed."
-        )
+    price_df = (
+        price_df
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    log.info(
+        f"Created current-month anchor row {current_month.strftime('%Y-%m-%d')}: "
+        f"NIFTY={current_price_df.iloc[0]['close']:.2f}, "
+        f"PE={current_pe}"
+    )
 
     # ------------------------------------------------------------------------
     # Merge prices + PE
@@ -1175,7 +1280,7 @@ def build_final_dataframe(
     )
 
     # ------------------------------------------------------------------------
-    # Validate every price month has PE after the live/latest-month merge
+    # Validate every row has PE
     # ------------------------------------------------------------------------
 
     missing_after_merge = merged.loc[
@@ -1184,7 +1289,6 @@ def build_final_dataframe(
     ]
 
     if not missing_after_merge.empty:
-
         months = (
             missing_after_merge
             .dt.strftime("%Y-%m")
@@ -1208,10 +1312,7 @@ def build_final_dataframe(
         & merged["close"].notna()
     )
 
-    merged.loc[
-        valid_pe,
-        "eps_ttm",
-    ] = (
+    merged.loc[valid_pe, "eps_ttm"] = (
         merged.loc[valid_pe, "close"]
         / merged.loc[valid_pe, "pe_ratio"]
     ).round(4)
@@ -1242,7 +1343,6 @@ def build_final_dataframe(
     ]
 
     if not bad_eps.empty:
-
         months = (
             bad_eps
             .dt.strftime("%Y-%m")
@@ -1259,17 +1359,11 @@ def build_final_dataframe(
     # ------------------------------------------------------------------------
 
     total = len(merged)
-
     pe_count = merged["pe_ratio"].notna().sum()
     eps_count = merged["eps_ttm"].notna().sum()
 
-    log.info(
-        f"PE coverage: {pe_count}/{total}"
-    )
-
-    log.info(
-        f"EPS coverage: {eps_count}/{total}"
-    )
+    log.info(f"PE coverage: {pe_count}/{total}")
+    log.info(f"EPS coverage: {eps_count}/{total}")
 
     return merged[
         [
