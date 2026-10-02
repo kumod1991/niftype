@@ -1,4 +1,4 @@
-"""
+
 Nifty 50 Monthly P/E Tracker (v7)
 
 Purpose
@@ -1255,6 +1255,7 @@ def validate_historical_pe_coverage(
 
 def build_final_dataframe(
     price_df: pd.DataFrame,
+    client: Client,
 ) -> pd.DataFrame:
 
     # ------------------------------------------------------------------------
@@ -1274,6 +1275,84 @@ def build_final_dataframe(
         .dropna(subset=["date", "pe_ratio"])
         .sort_values("date")
         .drop_duplicates(subset=["date"], keep="last")
+    )
+
+    # ------------------------------------------------------------------------
+    # Recover the immediately previous month's PE from Supabase when it is
+    # missing from the historical seed/embedded data.
+    #
+    # This is important on the 2nd of every month: the previous month's PE
+    # may have been maintained in Supabase by the daily mark-to-market job,
+    # while the static historical seed intentionally ends before that month.
+    # We preserve that existing PE rather than incorrectly assigning the new
+    # month's live PE to the previous month.
+    # ------------------------------------------------------------------------
+
+    current_month = (
+        pd.Timestamp.today()
+        .to_period("M")
+        .to_timestamp()
+    )
+
+    previous_month = (
+        current_month - pd.DateOffset(months=1)
+    ).normalize()
+
+    previous_month_key = previous_month.strftime("%Y-%m-%d")
+
+    try:
+        existing_result = (
+            client
+            .table(TABLE_NAME)
+            .select("date,pe_ratio,eps_ttm,pe_source")
+            .eq("ticker", TICKER)
+            .eq("date", previous_month_key)
+            .limit(1)
+            .execute()
+        )
+
+        existing_rows = existing_result.data or []
+
+        if existing_rows:
+            existing = existing_rows[0]
+            existing_pe = pd.to_numeric(
+                existing.get("pe_ratio"),
+                errors="coerce",
+            )
+
+            if pd.notna(existing_pe) and float(existing_pe) > 0:
+                existing_row = pd.DataFrame([{
+                    "date": previous_month,
+                    "pe_ratio": float(existing_pe),
+                    "pe_source": existing.get("pe_source")
+                        or "supabase_existing",
+                }])
+
+                if not (
+                    pe_df["date"]
+                    .eq(previous_month)
+                    .any()
+                ):
+                    pe_df = pd.concat(
+                        [pe_df, existing_row],
+                        ignore_index=True,
+                    )
+
+                    log.info(
+                        f"Recovered previous-month PE from Supabase: "
+                        f"{previous_month_key} = {float(existing_pe):.2f}"
+                    )
+
+    except Exception as e:
+        log.warning(
+            f"Could not recover previous-month PE from Supabase: {e}"
+        )
+
+    pe_df = (
+        pe_df
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
     )
 
     # ------------------------------------------------------------------------
@@ -1298,12 +1377,6 @@ def build_final_dataframe(
     validate_historical_pe_coverage(
         price_df,
         pe_df,
-    )
-
-    current_month = (
-        pd.Timestamp.today()
-        .to_period("M")
-        .to_timestamp()
     )
 
     # ------------------------------------------------------------------------
@@ -1652,7 +1725,8 @@ def run() -> None:
     # ------------------------------------------------------------------------
 
     final_df = build_final_dataframe(
-        price_df
+        price_df,
+        supabase,
     )
 
     # ------------------------------------------------------------------------
