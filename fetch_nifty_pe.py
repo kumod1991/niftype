@@ -833,14 +833,14 @@ def load_historical_pe() -> pd.DataFrame:
 def fetch_current_month_price() -> pd.DataFrame:
 
     """
-    Fetch month-to-date NIFTY 50 OHLCV for the current calendar month.
+    Build the current calendar-month anchor row.
 
-    The monthly yfinance series normally ends at the previous completed
-    month when this workflow runs on the 2nd. Therefore the current month
-    must be created separately.
+    On the 2nd of a month yfinance can still return only the previous
+    completed monthly bar, and its short daily window may also fail to
+    contain the current month. Therefore yfinance is attempted first, but
+    NSE allIndices is the fallback for the live/current index value.
 
-    The returned row is dated to the first day of the current month.
-    OHLCV is aggregated month-to-date from daily NIFTY data.
+    The row is always dated to YYYY-MM-01.
     """
 
     current_month = (
@@ -849,67 +849,173 @@ def fetch_current_month_price() -> pd.DataFrame:
         .to_timestamp()
     )
 
+    month_key = current_month.strftime("%Y-%m")
+
     log.info(
         f"Fetching current-month MTD OHLCV for {TICKER} "
-        f"({current_month.strftime('%Y-%m')}) ..."
+        f"({month_key}) ..."
     )
 
-    df = yf.Ticker(TICKER).history(
-        period="10d",
-        interval="1d",
-        auto_adjust=True,
-    )
-
-    if df.empty:
-        raise RuntimeError(
-            "yfinance returned empty daily data for current month."
+    # ----------------------------------------------------------------------
+    # 1. Try yfinance daily data first.
+    # ----------------------------------------------------------------------
+    try:
+        df = yf.Ticker(TICKER).history(
+            period="10d",
+            interval="1d",
+            auto_adjust=True,
         )
 
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_localize(None)
+        if not df.empty:
+            if getattr(df.index, "tz", None) is not None:
+                df.index = df.index.tz_localize(None)
 
-    df = df.reset_index()
+            df = df.reset_index()
+            df = df.rename(
+                columns={
+                    "Date": "date",
+                    "Open": "open",
+                    "High": "high",
+                    "Low": "low",
+                    "Close": "close",
+                    "Volume": "volume",
+                }
+            )
 
-    df = df.rename(
-        columns={
-            "Date": "date",
-            "Open": "open",
-            "High": "high",
-            "Low": "low",
-            "Close": "close",
-            "Volume": "volume",
-        }
-    )
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize()
 
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+            month_df = df[
+                df["date"].dt.to_period("M")
+                == current_month.to_period("M")
+            ].copy()
 
-    month_df = df[
-        df["date"].dt.to_period("M")
-        == current_month.to_period("M")
-    ].copy()
+            if not month_df.empty:
+                row = pd.DataFrame([{
+                    "date": current_month,
+                    "open": float(month_df.iloc[0]["open"]),
+                    "high": float(month_df["high"].max()),
+                    "low": float(month_df["low"].min()),
+                    "close": float(month_df.iloc[-1]["close"]),
+                    "volume": int(
+                        pd.to_numeric(
+                            month_df["volume"],
+                            errors="coerce",
+                        ).fillna(0).sum()
+                    ),
+                }])
 
-    if month_df.empty:
-        raise RuntimeError(
-            f"No daily NIFTY 50 price data found for "
-            f"current month {current_month.strftime('%Y-%m')}."
+                log.info(
+                    f"  -> Current month row from yfinance: "
+                    f"{month_key}-01 close={row.iloc[0]['close']:.2f}"
+                )
+                return row
+
+        log.warning(
+            "yfinance has no daily bar for the current calendar month; "
+            "falling back to NSE allIndices."
         )
 
-    # Month-to-date OHLCV.
-    row = pd.DataFrame([{
-        "date": current_month,
-        "open": float(month_df.iloc[0]["open"]),
-        "high": float(month_df["high"].max()),
-        "low": float(month_df["low"].min()),
-        "close": float(month_df.iloc[-1]["close"]),
-        "volume": int(pd.to_numeric(month_df["volume"], errors="coerce").fillna(0).sum()),
-    }])
+    except Exception as e:
+        log.warning(
+            f"yfinance current-month fetch failed: {e}; "
+            "falling back to NSE allIndices."
+        )
 
-    log.info(
-        f"  -> Current month row: {current_month.strftime('%Y-%m-%d')} "
-        f"close={row.iloc[0]['close']:.2f}"
-    )
+    # ----------------------------------------------------------------------
+    # 2. NSE fallback. This is the important fix for runs on 2nd/3rd/etc.
+    # ----------------------------------------------------------------------
+    session = _nse_session()
 
-    return row
+    try:
+        response = session.get(
+            "https://www.nseindia.com/api/allIndices",
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        for idx in payload.get("data", []):
+            name = (
+                idx.get("indexSymbol")
+                or idx.get("index")
+                or ""
+            ).upper()
+
+            if name != "NIFTY 50":
+                continue
+
+            def num(*keys, default=0.0):
+                for key in keys:
+                    value = idx.get(key)
+                    if value is not None and value != "":
+                        try:
+                            return float(str(value).replace(",", ""))
+                        except (TypeError, ValueError):
+                            pass
+                return float(default)
+
+            last_price = num(
+                "last",
+                "lastPrice",
+                "ltp",
+                "close",
+                default=0.0,
+            )
+
+            if last_price <= 0:
+                raise RuntimeError(
+                    "NSE allIndices returned NIFTY 50 but no valid live price."
+                )
+
+            # allIndices does not always expose complete month-to-date OHLCV.
+            # For the current anchor row, use the live index value safely.
+            # When NSE provides day/open/high/low fields, use them. Otherwise
+            # fall back to the live price rather than failing the whole job.
+            open_price = num("open", "openPrice", default=last_price)
+            high_price = num(
+                "dayHigh",
+                "high",
+                "dayHighPrice",
+                default=last_price,
+            )
+            low_price = num(
+                "dayLow",
+                "low",
+                "dayLowPrice",
+                default=last_price,
+            )
+            volume = num(
+                "totalTradedVolume",
+                "totalTradedVol",
+                "volume",
+                default=0,
+            )
+
+            row = pd.DataFrame([{
+                "date": current_month,
+                "open": open_price,
+                "high": max(high_price, last_price),
+                "low": min(low_price, last_price),
+                "close": last_price,
+                "volume": int(volume),
+            }])
+
+            log.info(
+                f"  -> Current month row from NSE: "
+                f"{month_key}-01 close={last_price:.2f}"
+            )
+
+            return row
+
+        raise RuntimeError(
+            "NIFTY 50 not found in NSE allIndices response."
+        )
+
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not obtain current-month NIFTY 50 price for {month_key}. "
+            f"yfinance and NSE allIndices both failed: {e}"
+        ) from e
 
 
 # ============================================================================
