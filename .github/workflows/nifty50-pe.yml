@@ -3,7 +3,7 @@ name: Fetch & Upsert Nifty 50 P/E
 
 on:
   schedule:
-    # 7:00 PM IST, Monday to Friday
+    # 7:00 PM IST, Monday to Friday (13:30 UTC)
     - cron: "30 13 * * 1-5"
 
   workflow_dispatch:
@@ -32,22 +32,41 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout
+      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------------------------------------
+      # 2. Python setup
+      # --------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
+      # --------------------------------------------------
+      # 3. Install dependencies
+      # --------------------------------------------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas yfinance
 
-      - name: Verify Python script
+      # --------------------------------------------------
+      # 4. Verify script and implementation
+      # --------------------------------------------------
+      - name: Verify tracker script
         run: |
-          echo "Checking sync_nifty_pe.py"
+          echo "=========================================="
+          echo "TRACKER SCRIPT VERIFICATION"
+          echo "=========================================="
+
+          echo "Commit SHA: $(git rev-parse HEAD)"
+          echo "Branch: $(git branch --show-current)"
+          echo "Python file: $(realpath sync_nifty_pe.py)"
 
           if [ ! -f "sync_nifty_pe.py" ]; then
             echo "::error::sync_nifty_pe.py not found"
@@ -58,11 +77,35 @@ jobs:
 
           echo "Python syntax check passed."
 
+          if grep -q "Warming up NSE session" sync_nifty_pe.py; then
+            echo "::error::Old NSE implementation detected"
+            exit 1
+          fi
+
+          if grep -q "fetch_nse_live_pe" sync_nifty_pe.py; then
+            echo "::error::Old NSE live-fetch function detected"
+            exit 1
+          fi
+
+          if ! grep -q "Nifty Indices historical data" sync_nifty_pe.py; then
+            echo "::error::Expected Nifty Indices implementation not found"
+            exit 1
+          fi
+
+          echo "New implementation verified."
+
+      # --------------------------------------------------
+      # 5. Verify Supabase configuration
+      # --------------------------------------------------
       - name: Diagnose tracker configuration
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
+          echo "=========================================="
+          echo "SUPABASE CONFIGURATION CHECK"
+          echo "=========================================="
+
           if [ -z "$SUPABASE_URL" ]; then
             echo "::error::SUPABASE_URL is missing"
             exit 1
@@ -73,21 +116,23 @@ jobs:
             exit 1
           fi
 
-          echo "Supabase URL configured"
-          echo "Supabase API key configured"
+          echo "Supabase URL configured."
+          echo "Supabase API key configured."
+          echo "API key length: ${#SUPABASE_KEY}"
 
-          if grep -q "fetch_nse_live_pe" sync_nifty_pe.py; then
-            echo "::error::Old NSE live-fetch function found"
-            exit 1
-          fi
+          case "$SUPABASE_KEY" in
+            sb_secret_*)
+              echo "New Supabase Secret API Key detected."
+              ;;
+            *)
+              echo "::error::Expected a Supabase sb_secret_ API key."
+              exit 1
+              ;;
+          esac
 
-          if grep -q "Warming up NSE session" sync_nifty_pe.py; then
-            echo "::error::Old NSE implementation found"
-            exit 1
-          fi
-
-          echo "New daily implementation verified."
-
+      # --------------------------------------------------
+      # 6. Run tracker
+      # --------------------------------------------------
       - name: Run Nifty 50 P/E tracker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -98,18 +143,29 @@ jobs:
 
           echo "=========================================="
           echo "NIFTY 50 P/E TRACKER"
-          echo "Mode: $MODE"
           echo "=========================================="
+
+          echo "Mode: $MODE"
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Python file: $(realpath sync_nifty_pe.py)"
 
           python sync_nifty_pe.py "$MODE"
 
+      # --------------------------------------------------
+      # 7. Success report
+      # --------------------------------------------------
       - name: Report completion
         if: success()
         run: |
-          echo "Nifty 50 P/E tracker completed successfully."
+          echo "=========================================="
+          echo "NIFTY 50 P/E TRACKER COMPLETED"
+          echo "=========================================="
 
+      # --------------------------------------------------
+      # 8. Failure report
+      # --------------------------------------------------
       - name: Report failure
         if: failure()
         run: |
-          echo "::error::Nifty 50 P/E tracker failed. Check the logs."
+          echo "::error::Nifty 50 P/E tracker failed. Check the preceding logs."
 ```
