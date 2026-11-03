@@ -1,4 +1,3 @@
-```yaml
 name: Fetch & Upsert Nifty 50 P/E
 
 on:
@@ -168,4 +167,3 @@ jobs:
         if: failure()
         run: |
           echo "::error::Nifty 50 P/E tracker failed. Check the preceding logs."
-```
