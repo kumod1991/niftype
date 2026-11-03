@@ -1,3 +1,38 @@
+      - name: Diagnose tracker configuration
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          echo "Checking credentials..."
+
+          if [ -z "$SUPABASE_URL" ]; then
+            echo "::error::SUPABASE_URL is missing"
+            exit 1
+          fi
+
+          if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "::error::SUPABASE_KEY is missing or not mapped"
+            exit 1
+          fi
+
+          echo "Supabase URL configured"
+          echo "Supabase API key configured"
+
+          echo "Checking Python implementation..."
+
+          grep -n "def run_daily" sync_nifty_pe.py
+
+          if grep -q "fetch_nse_live_pe" sync_nifty_pe.py; then
+            echo "::error::Old NSE fetch function still exists"
+            exit 1
+          fi
+
+          if grep -q "Warming up NSE session" sync_nifty_pe.py; then
+            echo "::error::Old NSE implementation still exists"
+            exit 1
+          fi
+
+          echo "New Python implementation verified"
 name: Fetch & Upsert Nifty 50 P/E
 
 on:
