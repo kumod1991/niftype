@@ -1,0 +1,102 @@
+name: Fetch & Upsert Nifty 50 P/E
+
+on:
+  schedule:
+    # Run at 7:00 PM IST, Monday to Friday
+    - cron: "30 13 * * 1-5"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Select the operation"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - backfill
+          - rebuild
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nifty50-pe-tracker
+  cancel-in-progress: false
+
+jobs:
+  fetch-and-upsert:
+    name: Fetch & upsert Nifty 50 P/E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      # ------------------------------------------------
+      # 1. Checkout repository
+      # ------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------
+      # 2. Setup Python
+      # ------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ------------------------------------------------
+      # 3. Install dependencies
+      # ------------------------------------------------
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas yfinance
+
+      # ------------------------------------------------
+      # 4. Verify Python script
+      # ------------------------------------------------
+      - name: Verify tracker script
+        run: |
+          if [ ! -f "sync_nifty_pe.py" ]; then
+            echo "::error::sync_nifty_pe.py not found in repository root"
+            exit 1
+          fi
+
+          python -m py_compile sync_nifty_pe.py
+          echo "Tracker script verified successfully."
+
+      # ------------------------------------------------
+      # 5. Run tracker
+      # ------------------------------------------------
+      - name: Run Nifty 50 P/E tracker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          MODE="${{ inputs.mode || 'daily' }}"
+
+          echo "=========================================="
+          echo "NIFTY 50 P/E TRACKER"
+          echo "Mode: $MODE"
+          echo "=========================================="
+
+          python sync_nifty_pe.py "$MODE"
+
+      # ------------------------------------------------
+      # 6. Completion
+      # ------------------------------------------------
+      - name: Report completion
+        if: success()
+        run: |
+          echo "Nifty 50 P/E tracker completed successfully."
+
+      # ------------------------------------------------
+      # 7. Failure notification in logs
+      # ------------------------------------------------
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::Nifty 50 P/E tracker failed. Check the preceding logs."
