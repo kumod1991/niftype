@@ -16,7 +16,7 @@ import yfinance as yf
 # ============================================================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 DAILY_TABLE = "nifty50_pe_daily"
 MONTHLY_TABLE = "nifty50_pe"
