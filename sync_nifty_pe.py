@@ -125,9 +125,11 @@ def parse_nifty_date(value):
 
 
 def supabase_headers():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase credentials are missing")
+
     return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY.strip(),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
