@@ -15,41 +15,47 @@ import yfinance as yf
 # CONFIGURATION
 # ============================================================
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 DAILY_TABLE = "nifty50_pe_daily"
 MONTHLY_TABLE = "nifty50_pe"
+
 TICKER = "^NSEI"
 INDEX_NAME = "NIFTY 50"
 
 IST = ZoneInfo("Asia/Kolkata")
 
 HISTORICAL_START = date(2016, 1, 1)
-REQUEST_DELAY_SECONDS = 1.5
-REQUEST_TIMEOUT = 60
 
-NIFTY_INDICES_BASE = "https://www.niftyindices.com"
-HISTORICAL_PAGE = (
+REQUEST_TIMEOUT = 60
+REQUEST_DELAY = 1.0
+BATCH_SIZE = 500
+
+# Current Nifty Indices API route first; legacy route as fallback.
+NIFTY_PE_ENDPOINTS = [
+    "https://niftyindices.com/BackPage/getpepbHistoricaldataDBtoString",
+    "https://www.niftyindices.com/BackPage/getpepbHistoricaldataDBtoString",
+    "https://www.niftyindices.com/Backpage.aspx/getpepbHistoricaldataDBtoString",
+]
+
+NIFTY_PRICE_ENDPOINTS = [
+    "https://niftyindices.com/BackPage/getHistoricaldatatabletoString",
+    "https://www.niftyindices.com/Backpage.aspx/getHistoricaldatatabletoString",
+]
+
+NIFTY_HISTORY_PAGE = (
     "https://www.niftyindices.com/reports/historical-data"
 )
 
-PE_HISTORY_URL = (
-    f"{NIFTY_INDICES_BASE}/Backpage.aspx/"
-    "getpepbHistoricaldataDBtoString"
-)
+NIFTY_HOME = "https://niftyindices.com/"
 
-PRICE_HISTORY_URL = (
-    f"{NIFTY_INDICES_BASE}/Backpage.aspx/"
-    "getHistoricaldatatabletoString"
-)
-
-NSE_HOME_URL = "https://www.nseindia.com/"
-NSE_ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
+# Yahoo Finance is used only as a fallback for monthly closing prices.
+YAHOO_TICKER = "^NSEI"
 
 
 # ============================================================
-# LOGGING AND HTTP SESSION
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -58,6 +64,11 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("nifty50-pe")
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
 
 session = requests.Session()
 
@@ -71,6 +82,10 @@ session.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json; charset=UTF-8",
+    "Origin": "https://niftyindices.com",
+    "Referer": NIFTY_HISTORY_PAGE,
+    "X-Requested-With": "XMLHttpRequest",
 })
 
 
@@ -88,23 +103,27 @@ def to_float(value):
 
     value = str(value).strip()
 
-    if value in ("", "-", "NA", "N/A", "null", "None"):
+    if value.lower() in (
+        "", "-", "na", "n/a", "null", "none", "nan", "false"
+    ):
         return None
 
     value = value.replace(",", "")
 
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (ValueError, TypeError):
+        return None
+
+    if pd.isna(result):
         return None
 
     return result
 
 
 def parse_nifty_date(value):
-    """Parse dates returned by Nifty Indices."""
     if not value:
-        raise ValueError("Historical record has no date")
+        raise ValueError("Missing date in Nifty Indices response")
 
     value = str(value).strip()
 
@@ -113,23 +132,57 @@ def parse_nifty_date(value):
         "%d-%b-%Y",
         "%d %B %Y",
         "%Y-%m-%d",
+        "%d/%m/%Y",
     ]
 
     for fmt in formats:
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
-            pass
+            continue
 
-    raise ValueError(f"Unrecognised date format: {value}")
+    raise ValueError(
+        f"Unrecognised Nifty Indices date: {value}"
+    )
+
+
+def date_range_chunks(start_date, end_date, days=364):
+    current = start_date
+
+    while current <= end_date:
+        chunk_end = min(
+            current + timedelta(days=days),
+            end_date,
+        )
+
+        yield current, chunk_end
+
+        current = chunk_end + timedelta(days=1)
+
+
+# ============================================================
+# SUPABASE AUTHENTICATION
+# ============================================================
+
+def validate_supabase_credentials():
+    if not SUPABASE_URL:
+        raise RuntimeError(
+            "GitHub secret SUPABASE_URL is missing."
+        )
+
+    if not SUPABASE_KEY:
+        raise RuntimeError(
+            "GitHub secret SUPABASE_SERVICE_ROLE_KEY is missing."
+        )
 
 
 def supabase_headers():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Supabase credentials are missing")
+    validate_supabase_credentials()
 
+    # Supabase sb_secret_* API keys are sent in the apikey header.
+    # Do not treat this key as a legacy JWT.
     return {
-        "apikey": SUPABASE_KEY.strip(),
+        "apikey": SUPABASE_KEY,
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Prefer": "resolution=merge-duplicates,return=minimal",
@@ -137,12 +190,12 @@ def supabase_headers():
 
 
 # ============================================================
-# SUPABASE OPERATIONS
+# SUPABASE UPSERT
 # ============================================================
 
 def supabase_upsert(table, rows, conflict="date,ticker"):
     if not rows:
-        log.warning("No rows to upsert into %s", table)
+        log.warning("No rows supplied for table %s", table)
         return
 
     url = f"{SUPABASE_URL}/rest/v1/{table}"
@@ -150,10 +203,10 @@ def supabase_upsert(table, rows, conflict="date,ticker"):
     headers = supabase_headers()
     params = {"on_conflict": conflict}
 
-    batch_size = 500
+    total = len(rows)
 
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start:start + batch_size]
+    for start in range(0, total, BATCH_SIZE):
+        batch = rows[start:start + BATCH_SIZE]
 
         response = requests.post(
             url,
@@ -166,19 +219,30 @@ def supabase_upsert(table, rows, conflict="date,ticker"):
         if not response.ok:
             raise RuntimeError(
                 f"Supabase upsert failed for {table}: "
-                f"{response.status_code} {response.text[:1500]}"
+                f"HTTP {response.status_code}: "
+                f"{response.text[:2000]}"
             )
+
+        log.info(
+            "Upserted batch %s-%s of %s into %s",
+            start + 1,
+            start + len(batch),
+            total,
+            table,
+        )
 
     log.info(
         "Successfully upserted %s rows into %s",
-        len(rows),
+        total,
         table,
     )
 
 
-def supabase_get_daily(start_date, end_date):
-    """Read daily observations from Supabase with pagination."""
+# ============================================================
+# SUPABASE READ
+# ============================================================
 
+def supabase_get_daily(start_date, end_date):
     url = f"{SUPABASE_URL}/rest/v1/{DAILY_TABLE}"
 
     headers = supabase_headers()
@@ -207,8 +271,9 @@ def supabase_get_daily(start_date, end_date):
 
         if not response.ok:
             raise RuntimeError(
-                f"Supabase read failed: "
-                f"{response.status_code} {response.text[:1500]}"
+                f"Supabase daily read failed: "
+                f"HTTP {response.status_code}: "
+                f"{response.text[:2000]}"
             )
 
         page = response.json()
@@ -229,46 +294,65 @@ def supabase_get_daily(start_date, end_date):
 
 
 # ============================================================
-# NIFTY INDICES HISTORICAL API
+# NIFTY INDICES SESSION
 # ============================================================
 
 def warm_nifty_indices_session():
     """
-    Warm up the Nifty Indices session.
+    Warm up the Nifty Indices website session.
 
-    The historical endpoint is undocumented and access behaviour
-    can change. This GET is defensive; the POST response is still
-    validated independently.
+    This does not access nseindia.com.
     """
 
     try:
         response = session.get(
-            HISTORICAL_PAGE,
-            timeout=15,
+            NIFTY_HOME,
+            timeout=20,
         )
 
         log.info(
-            "Nifty Indices page status: %s",
+            "Nifty Indices home response: HTTP %s",
             response.status_code,
         )
 
     except requests.RequestException as exc:
         log.warning(
-            "Historical page warm-up failed; will try API directly: %s",
+            "Nifty Indices home warm-up failed: %s",
+            exc,
+        )
+
+    try:
+        response = session.get(
+            NIFTY_HISTORY_PAGE,
+            timeout=20,
+        )
+
+        log.info(
+            "Nifty Indices historical page response: HTTP %s",
+            response.status_code,
+        )
+
+    except requests.RequestException as exc:
+        log.warning(
+            "Historical page warm-up failed: %s",
             exc,
         )
 
 
-def historical_request_payload(start_date, end_date):
+# ============================================================
+# NIFTY INDICES REQUEST HELPERS
+# ============================================================
+
+def build_cinfo(start_date, end_date):
     """
-    Nifty Indices expects cinfo to be a string containing a
-    single-quoted object, not a nested JSON object.
+    Build the request string expected by the Nifty Indices
+    historical-data endpoints.
     """
 
     start_text = start_date.strftime("%d-%b-%Y")
     end_text = end_date.strftime("%d-%b-%Y")
 
-    cinfo = (
+    return (
         "{"
         f"'name':'{INDEX_NAME}',"
         f"'startDate':'{start_text}',"
@@ -277,73 +361,126 @@ def historical_request_payload(start_date, end_date):
         "}"
     )
 
-    return {"cinfo": cinfo}
 
+def parse_nifty_response(response):
+    """
+    Support both known response formats:
 
-def post_historical_endpoint(url, start_date, end_date):
-    payload = historical_request_payload(start_date, end_date)
+    Older:
+        {"d": "[{...},{...}]"}
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": NIFTY_INDICES_BASE,
-        "Referer": HISTORICAL_PAGE,
-    }
+    Newer:
+        [{...},{...}]
 
-    response = session.post(
-        url,
-        headers=headers,
-        data=json.dumps(payload),
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"Nifty Indices HTTP {response.status_code}: "
-            f"{response.text[:1500]}"
-        )
+    Also handles a JSON-encoded string containing an array.
+    """
 
     try:
-        outer = response.json()
+        payload = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            f"Nifty Indices did not return JSON: "
-            f"{response.text[:1000]}"
+            "Nifty Indices response was not valid JSON: "
+            + response.text[:1000]
         ) from exc
 
-    if not isinstance(outer, dict) or "d" not in outer:
-        raise RuntimeError(
-            f"Unexpected historical response structure: "
-            f"{str(outer)[:1000]}"
-        )
+    if isinstance(payload, dict) and "d" in payload:
+        payload = payload["d"]
 
-    raw_data = outer["d"]
+    if isinstance(payload, str):
+        stripped = payload.strip()
 
-    if isinstance(raw_data, str):
+        if stripped.lower() in ("", "false", "[]"):
+            return []
+
         try:
-            records = json.loads(raw_data)
+            payload = json.loads(stripped)
         except ValueError as exc:
             raise RuntimeError(
-                f"Could not decode historical response field 'd': "
-                f"{raw_data[:1000]}"
+                "Could not decode Nifty Indices response data: "
+                + stripped[:1000]
             ) from exc
-    else:
-        records = raw_data
 
-    if not isinstance(records, list):
+    if payload is None or payload is False:
+        return []
+
+    if not isinstance(payload, list):
         raise RuntimeError(
-            f"Historical response is not a list: "
-            f"{str(records)[:1000]}"
+            "Unexpected Nifty Indices response structure: "
+            + str(payload)[:1500]
         )
 
-    return records
+    return payload
 
+
+def call_nifty_endpoint(endpoints, start_date, end_date):
+    """
+    Try current Nifty Indices endpoint routes first, then legacy routes.
+    """
+
+    payload = {
+        "cinfo": build_cinfo(start_date, end_date)
+    }
+
+    errors = []
+
+    for url in endpoints:
+        try:
+            log.info("Requesting Nifty Indices endpoint: %s", url)
+
+            response = session.post(
+                url,
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if not response.ok:
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:1000]}"
+                )
+
+            records = parse_nifty_response(response)
+
+            # Empty result can mean no trading days, no data,
+            # or a rejected index/date request. Try next route.
+            if not records:
+                log.warning(
+                    "Endpoint returned no records: %s",
+                    url,
+                )
+                continue
+
+            log.info(
+                "Endpoint returned %s records",
+                len(records),
+            )
+
+            return records
+
+        except Exception as exc:
+            message = f"{url}: {exc}"
+            errors.append(message)
+
+            log.warning(
+                "Endpoint attempt failed: %s",
+                message,
+            )
+
+        time.sleep(REQUEST_DELAY)
+
+    raise RuntimeError(
+        "All Nifty Indices endpoint attempts failed or returned "
+        "no records.\n" + "\n".join(errors)
+    )
+
+
+# ============================================================
+# HISTORICAL DAILY P/E
+# ============================================================
 
 def fetch_historical_pe(start_date, end_date):
-    records = post_historical_endpoint(
-        PE_HISTORY_URL,
+    records = call_nifty_endpoint(
+        NIFTY_PE_ENDPOINTS,
         start_date,
         end_date,
     )
@@ -351,9 +488,20 @@ def fetch_historical_pe(start_date, end_date):
     rows = []
 
     for item in records:
-        observation_date = parse_nifty_date(
-            item.get("DATE") or item.get("Date")
+        raw_date = (
+            item.get("DATE")
+            or item.get("Date")
+            or item.get("date")
         )
+
+        if not raw_date:
+            log.warning(
+                "Skipping PE record without date: %s",
+                str(item)[:300],
+            )
+            continue
+
+        observation_date = parse_nifty_date(raw_date)
 
         pe = to_float(item.get("pe"))
         pb = to_float(item.get("pb"))
@@ -369,12 +517,25 @@ def fetch_historical_pe(start_date, end_date):
             "pe_source": "Nifty Indices historical data",
         })
 
+    rows.sort(key=lambda x: x["date"])
+
     return rows
 
 
+# ============================================================
+# HISTORICAL DAILY INDEX CLOSE
+# ============================================================
+
 def fetch_historical_closes(start_date, end_date):
-    records = post_historical_endpoint(
-        PRICE_HISTORY_URL,
+    """
+    Retrieve daily index closing values.
+
+    If this secondary endpoint is unavailable, P/E collection
+    can still proceed. Monthly close can be obtained from Yahoo.
+    """
+
+    records = call_nifty_endpoint(
+        NIFTY_PRICE_ENDPOINTS,
         start_date,
         end_date,
     )
@@ -382,12 +543,16 @@ def fetch_historical_closes(start_date, end_date):
     closes = {}
 
     for item in records:
-        observation_date = parse_nifty_date(
+        raw_date = (
             item.get("HistoricalDate")
             or item.get("DATE")
             or item.get("Date")
         )
 
+        if not raw_date:
+            continue
+
+        observation_date = parse_nifty_date(raw_date)
         close = to_float(item.get("CLOSE"))
 
         if close is not None:
@@ -396,31 +561,32 @@ def fetch_historical_closes(start_date, end_date):
     return closes
 
 
-def fetch_historical_chunk(start_date, end_date):
+def attach_closes(pe_rows, start_date, end_date):
     """
-    Fetch historical P/E and index closing values for one chunk.
+    Attach closing values to P/E rows.
+
+    Failure to obtain prices does not discard valid P/E records.
     """
 
-    log.info(
-        "Fetching historical data: %s to %s",
-        start_date,
-        end_date,
-    )
+    try:
+        close_map = fetch_historical_closes(
+            start_date,
+            end_date,
+        )
 
-    pe_rows = fetch_historical_pe(start_date, end_date)
+        for row in pe_rows:
+            row["close"] = close_map.get(row["date"])
 
-    time.sleep(REQUEST_DELAY_SECONDS)
+        log.info(
+            "Attached closing prices to %s observations",
+            sum(1 for row in pe_rows if row["close"] is not None),
+        )
 
-    close_map = fetch_historical_closes(start_date, end_date)
-
-    for row in pe_rows:
-        row["close"] = close_map.get(row["date"])
-
-    log.info(
-        "Historical chunk: %s PE records, %s closing prices",
-        len(pe_rows),
-        len(close_map),
-    )
+    except Exception as exc:
+        log.warning(
+            "Could not retrieve historical closing prices: %s",
+            exc,
+        )
 
     return pe_rows
 
@@ -430,286 +596,195 @@ def fetch_historical_chunk(start_date, end_date):
 # ============================================================
 
 def run_backfill():
-    """
-    Fetch daily PE and close history from Nifty Indices.
-
-    Uses annual chunks to reduce the chance of server rejection.
-    Existing rows are updated using the date,ticker primary key.
-    """
+    log.info("=" * 60)
+    log.info("STARTING HISTORICAL DAILY P/E BACKFILL")
+    log.info("=" * 60)
 
     warm_nifty_indices_session()
 
     end_date = current_ist_date()
-    chunk_start = HISTORICAL_START
 
     all_rows = []
 
-    while chunk_start <= end_date:
-        chunk_end = min(
-            chunk_start + timedelta(days=364),
-            end_date,
-        )
-
-        rows = fetch_historical_chunk(
+    for chunk_start, chunk_end in date_range_chunks(
+        HISTORICAL_START,
+        end_date,
+        days=350,
+    ):
+        log.info(
+            "Backfill period: %s to %s",
             chunk_start,
             chunk_end,
         )
 
-        all_rows.extend(rows)
+        pe_rows = fetch_historical_pe(
+            chunk_start,
+            chunk_end,
+        )
 
-        chunk_start = chunk_end + timedelta(days=1)
+        if pe_rows:
+            pe_rows = attach_closes(
+                pe_rows,
+                chunk_start,
+                chunk_end,
+            )
 
-        time.sleep(REQUEST_DELAY_SECONDS)
+            all_rows.extend(pe_rows)
+
+            log.info(
+                "Collected %s P/E rows for this period",
+                len(pe_rows),
+            )
+        else:
+            log.warning(
+                "No P/E observations for %s to %s",
+                chunk_start,
+                chunk_end,
+            )
+
+        time.sleep(REQUEST_DELAY)
 
     if not all_rows:
         raise RuntimeError(
-            "Historical backfill returned zero rows. "
-            "No database update performed."
+            "Historical backfill returned zero P/E records. "
+            "No Supabase data was changed."
         )
 
-    # Ensure duplicate dates within the downloaded data are removed.
+    # Deduplicate by date and ticker.
     deduplicated = {}
 
     for row in all_rows:
         key = (row["date"], row["ticker"])
         deduplicated[key] = row
 
-    final_rows = list(deduplicated.values())
+    final_rows = sorted(
+        deduplicated.values(),
+        key=lambda x: x["date"],
+    )
 
-    final_rows.sort(key=lambda x: x["date"])
-
-    pe_count = sum(
+    valid_pe_count = sum(
         1 for row in final_rows
         if row["pe_ratio"] is not None
     )
 
-    if pe_count == 0:
+    if valid_pe_count == 0:
         raise RuntimeError(
-            "Historical response contained no valid PE values."
+            "Backfill contained no valid P/E values."
         )
 
-    supabase_upsert(DAILY_TABLE, final_rows)
+    supabase_upsert(
+        DAILY_TABLE,
+        final_rows,
+    )
 
     log.info(
-        "Backfill complete: %s rows, %s with PE values, %s to %s",
+        "Historical backfill completed: %s total rows, "
+        "%s valid P/E rows, period %s to %s",
         len(final_rows),
-        pe_count,
+        valid_pe_count,
         final_rows[0]["date"],
         final_rows[-1]["date"],
     )
 
 
 # ============================================================
-# LIVE NSE DAILY COLLECTION
+# DAILY COLLECTION
 # ============================================================
-
-def parse_nse_observation_date(record):
-    """
-    Parse the observation date from NSE's index record.
-
-    If the response has no parseable timestamp, use today's India
-    date only as a fallback. The caller logs this fallback.
-    """
-
-    candidates = [
-        record.get("lastUpdateTime"),
-        record.get("timestamp"),
-        record.get("time"),
-    ]
-
-    formats = [
-        "%d-%b-%Y %H:%M:%S",
-        "%d-%b-%Y",
-        "%d %b %Y %H:%M:%S",
-        "%d %b %Y",
-        "%d-%m-%Y %H:%M:%S",
-    ]
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        for fmt in formats:
-            try:
-                return datetime.strptime(
-                    str(candidate).strip(),
-                    fmt,
-                ).date()
-            except ValueError:
-                continue
-
-    log.warning(
-        "NSE record did not contain a recognised date. "
-        "Using current India date as fallback."
-    )
-
-    return current_ist_date()
-
-
-def fetch_nse_live_pe():
-    """
-    Fetch the latest NIFTY 50 P/E snapshot from NSE.
-
-    This endpoint provides the current snapshot; it is not a
-    historical daily series.
-    """
-
-    log.info("Warming up NSE session")
-
-    home_response = session.get(
-        NSE_HOME_URL,
-        timeout=30,
-    )
-    home_response.raise_for_status()
-
-    time.sleep(1)
-
-    response = session.get(
-        NSE_ALL_INDICES_URL,
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    payload = response.json()
-
-    records = payload.get("data", [])
-
-    record = next(
-        (
-            item for item in records
-            if str(item.get("index", "")).strip().upper()
-            == INDEX_NAME
-        ),
-        None,
-    )
-
-    if record is None:
-        raise RuntimeError(
-            "NIFTY 50 was not found in NSE allIndices response."
-        )
-
-    pe = to_float(record.get("pe"))
-    close = to_float(record.get("last"))
-
-    if pe is None or pe <= 0:
-        raise RuntimeError(
-            f"NSE returned invalid NIFTY 50 PE: {record.get('pe')}"
-        )
-
-    observation_date = parse_nse_observation_date(record)
-
-    if observation_date > current_ist_date():
-        raise RuntimeError(
-            f"NSE returned a future observation date: {observation_date}"
-        )
-
-    return {
-        "date": observation_date.isoformat(),
-        "ticker": TICKER,
-        "close": close,
-        "pe_ratio": pe,
-        "pb_ratio": to_float(record.get("pb")),
-        "div_yield": to_float(record.get("divYield")),
-        "pe_source": "NSE allIndices live snapshot",
-    }
-
 
 def run_daily():
     """
-    Fetch the latest published Nifty 50 daily PE from
-    Nifty Indices historical data.
+    Fetch the latest available published daily Nifty P/E.
 
-    Does not access nseindia.com.
+    No NSE live API is called in this function.
     """
 
-    log.info("Starting daily Nifty 50 PE collection")
+    log.info("=" * 60)
+    log.info("STARTING DAILY NIFTY 50 P/E COLLECTION")
+    log.info("Source: Nifty Indices historical data")
+    log.info("=" * 60)
+
     warm_nifty_indices_session()
 
     today = current_ist_date()
     start_date = today - timedelta(days=15)
 
     log.info(
-        "Requesting recent Nifty PE history: %s to %s",
+        "Fetching recent P/E observations: %s to %s",
         start_date,
         today,
     )
 
-    # Fetch recent daily PE records.
-    rows = fetch_historical_pe(start_date, today)
+    rows = fetch_historical_pe(
+        start_date,
+        today,
+    )
 
     if not rows:
         raise RuntimeError(
-            "Nifty Indices returned no recent PE observations."
+            "Nifty Indices returned no recent P/E observations."
         )
 
-    # Keep only valid observations up to today's date.
     valid_rows = [
         row for row in rows
         if (
-            row.get("pe_ratio") is not None
-            and row.get("date")
+            row["pe_ratio"] is not None
             and row["date"] <= today.isoformat()
         )
     ]
 
     if not valid_rows:
         raise RuntimeError(
-            "No valid recent Nifty PE observations were returned."
+            "No valid P/E observations were found in the response."
         )
 
-    # Select the latest available trading-day observation.
-    latest = max(valid_rows, key=lambda x: x["date"])
-
-    # Fetch the corresponding index closing price.
-    latest_date = datetime.strptime(
-        latest["date"], "%Y-%m-%d"
-    ).date()
-
-    close_map = fetch_historical_closes(
-        latest_date,
-        latest_date,
+    latest = max(
+        valid_rows,
+        key=lambda row: row["date"],
     )
 
-    latest["close"] = close_map.get(latest["date"])
-    latest["pe_source"] = "Nifty Indices daily historical data"
+    latest_date = datetime.strptime(
+        latest["date"],
+        "%Y-%m-%d",
+    ).date()
+
+    latest = attach_closes(
+        [latest],
+        latest_date,
+        latest_date,
+    )[0]
+
+    latest["pe_source"] = "Nifty Indices historical data"
 
     log.info(
-        "Latest available observation: date=%s PE=%s close=%s",
+        "Latest available observation: date=%s | PE=%s | close=%s",
         latest["date"],
         latest["pe_ratio"],
         latest["close"],
     )
 
-    # Save the daily observation.
     supabase_upsert(
         DAILY_TABLE,
         [latest],
     )
 
-    log.info("Daily PE observation saved successfully.")
+    log.info("Daily P/E successfully saved to Supabase.")
 
-    # Rebuild monthly history.
     rebuild_monthly()
 
     log.info("Daily collection completed successfully.")
 
 
 # ============================================================
-# MONTHLY AGGREGATION
+# MONTHLY CLOSE PRICE FALLBACK
 # ============================================================
 
 def fetch_monthly_closes():
-    """
-    Download monthly Nifty 50 closing prices from Yahoo Finance.
-
-    Yahoo Finance is used only for monthly index close values.
-    P/E values always come from the daily NSE/Nifty Indices data.
-    """
-
     today = current_ist_date()
 
+    log.info("Fetching monthly Nifty 50 closing prices from Yahoo Finance")
+
     data = yf.download(
-        TICKER,
+        YAHOO_TICKER,
         start=HISTORICAL_START.isoformat(),
         end=(today + timedelta(days=2)).isoformat(),
         interval="1mo",
@@ -719,36 +794,49 @@ def fetch_monthly_closes():
     )
 
     if data.empty:
-        raise RuntimeError(
-            "Yahoo Finance returned no monthly Nifty price data."
+        log.warning(
+            "Yahoo Finance returned no monthly prices."
         )
+        return {}
 
     if isinstance(data.columns, pd.MultiIndex):
         close_series = data["Close"].iloc[:, 0]
     else:
         close_series = data["Close"]
 
-    monthly_closes = {}
+    result = {}
 
     for timestamp, value in close_series.dropna().items():
         month_key = pd.Timestamp(timestamp).strftime("%Y-%m")
         close = to_float(value)
 
         if close is not None:
-            monthly_closes[month_key] = close
+            result[month_key] = close
 
-    return monthly_closes
+    log.info(
+        "Downloaded %s monthly closing prices",
+        len(result),
+    )
 
+    return result
+
+
+# ============================================================
+# MONTHLY AGGREGATION
+# ============================================================
 
 def rebuild_monthly():
     """
-    Build the monthly table from the last available daily PE
-    observation in each calendar month.
+    Derive monthly Nifty P/E using the last available daily
+    P/E observation of each calendar month.
 
-    Monthly date convention: first day of each month.
+    The monthly date key remains YYYY-MM-01 to preserve
+    compatibility with the existing monthly table.
     """
 
-    log.info("Rebuilding monthly Nifty PE table")
+    log.info("=" * 60)
+    log.info("REBUILDING MONTHLY NIFTY 50 P/E TABLE")
+    log.info("=" * 60)
 
     today = current_ist_date()
 
@@ -760,21 +848,24 @@ def rebuild_monthly():
     if not daily_rows:
         raise RuntimeError(
             "No daily observations found in Supabase. "
-            "Run backfill before rebuilding monthly data."
+            "Run backfill first."
         )
 
-    # Keep only observations with a valid PE.
-    valid_rows = [
-        row for row in daily_rows
-        if to_float(row.get("pe_ratio")) is not None
-    ]
+    valid_rows = []
+
+    for row in daily_rows:
+        pe = to_float(row.get("pe_ratio"))
+
+        if pe is None or pe <= 0:
+            continue
+
+        valid_rows.append(row)
 
     if not valid_rows:
         raise RuntimeError(
-            "No valid daily PE observations found."
+            "No valid daily P/E observations found in Supabase."
         )
 
-    # Select the last PE observation in each calendar month.
     latest_by_month = {}
 
     for row in valid_rows:
@@ -782,7 +873,10 @@ def rebuild_monthly():
 
         existing = latest_by_month.get(month_key)
 
-        if existing is None or row["date"] > existing["date"]:
+        if (
+            existing is None
+            or row["date"] > existing["date"]
+        ):
             latest_by_month[month_key] = row
 
     monthly_closes = fetch_monthly_closes()
@@ -793,12 +887,8 @@ def rebuild_monthly():
         row = latest_by_month[month_key]
 
         pe = to_float(row.get("pe_ratio"))
-
-        # Prefer the close associated with the selected PE date.
-        # Historical PE endpoint close is populated during backfill.
         close = to_float(row.get("close"))
 
-        # If daily close is unavailable, use Yahoo monthly close.
         if close is None:
             close = monthly_closes.get(month_key)
 
@@ -817,7 +907,7 @@ def rebuild_monthly():
 
     if not monthly_rows:
         raise RuntimeError(
-            "Monthly aggregation produced zero rows."
+            "Monthly aggregation generated zero records."
         )
 
     supabase_upsert(
@@ -826,8 +916,12 @@ def rebuild_monthly():
     )
 
     log.info(
-        "Monthly table refreshed: %s records (%s to %s)",
+        "Monthly table successfully refreshed: %s rows",
         len(monthly_rows),
+    )
+
+    log.info(
+        "Monthly coverage: %s to %s",
         monthly_rows[0]["date"],
         monthly_rows[-1]["date"],
     )
@@ -839,15 +933,17 @@ def rebuild_monthly():
 
 def main():
     mode = (
-        sys.argv[1].lower()
+        sys.argv[1].strip().lower()
         if len(sys.argv) > 1
         else "daily"
     )
 
-    log.info("=" * 60)
+    log.info("=" * 65)
     log.info("NIFTY 50 DAILY P/E TRACKER")
     log.info("Mode: %s", mode)
-    log.info("=" * 60)
+    log.info("=" * 65)
+
+    validate_supabase_credentials()
 
     if mode == "daily":
         run_daily()
@@ -861,13 +957,14 @@ def main():
 
     else:
         raise SystemExit(
-            "Invalid mode. Use: daily, backfill, or rebuild."
+            "Invalid mode. Use daily, backfill, or rebuild."
         )
 
 
 if __name__ == "__main__":
     try:
         main()
+
     except Exception:
         log.exception("Nifty PE tracker failed")
         raise
