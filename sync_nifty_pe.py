@@ -16,7 +16,12 @@ import yfinance as yf
 # ============================================================
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get(SUPABASE_SERVICE_ROLE_KEY", "").strip()
+
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or ""
+).strip()
 
 DAILY_TABLE = "nifty50_pe_daily"
 MONTHLY_TABLE = "nifty50_pe"
@@ -897,12 +902,18 @@ def rebuild_monthly():
         if close is not None and pe is not None and pe > 0:
             eps_ttm = round(close / pe, 2)
 
+        if close is None:
+            raise RuntimeError(
+                f"Monthly closing price unavailable for {month_key}"
+            )
+
         monthly_rows.append({
             "date": f"{month_key}-01",
             "ticker": TICKER,
             "close": close,
-            "pe": pe,
+            "pe_ratio": pe,
             "eps_ttm": eps_ttm,
+            "pe_source": "Nifty Indices historical data",
         })
 
     if not monthly_rows:
