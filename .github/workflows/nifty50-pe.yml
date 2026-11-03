@@ -73,7 +73,7 @@ jobs:
       - name: Run Nifty 50 P/E tracker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
           MODE="${{ inputs.mode || 'daily' }}"
