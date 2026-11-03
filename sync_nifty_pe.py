@@ -615,25 +615,83 @@ def fetch_nse_live_pe():
 
 
 def run_daily():
-    log.info("Starting daily Nifty 50 PE collection")
+    """
+    Fetch the latest published Nifty 50 daily PE from
+    Nifty Indices historical data.
 
-    row = fetch_nse_live_pe()
+    Does not access nseindia.com.
+    """
+
+    log.info("Starting daily Nifty 50 PE collection")
+    warm_nifty_indices_session()
+
+    today = current_ist_date()
+    start_date = today - timedelta(days=15)
 
     log.info(
-        "NSE observation: date=%s close=%s PE=%s",
-        row["date"],
-        row["close"],
-        row["pe_ratio"],
+        "Requesting recent Nifty PE history: %s to %s",
+        start_date,
+        today,
     )
 
+    # Fetch recent daily PE records.
+    rows = fetch_historical_pe(start_date, today)
+
+    if not rows:
+        raise RuntimeError(
+            "Nifty Indices returned no recent PE observations."
+        )
+
+    # Keep only valid observations up to today's date.
+    valid_rows = [
+        row for row in rows
+        if (
+            row.get("pe_ratio") is not None
+            and row.get("date")
+            and row["date"] <= today.isoformat()
+        )
+    ]
+
+    if not valid_rows:
+        raise RuntimeError(
+            "No valid recent Nifty PE observations were returned."
+        )
+
+    # Select the latest available trading-day observation.
+    latest = max(valid_rows, key=lambda x: x["date"])
+
+    # Fetch the corresponding index closing price.
+    latest_date = datetime.strptime(
+        latest["date"], "%Y-%m-%d"
+    ).date()
+
+    close_map = fetch_historical_closes(
+        latest_date,
+        latest_date,
+    )
+
+    latest["close"] = close_map.get(latest["date"])
+    latest["pe_source"] = "Nifty Indices daily historical data"
+
+    log.info(
+        "Latest available observation: date=%s PE=%s close=%s",
+        latest["date"],
+        latest["pe_ratio"],
+        latest["close"],
+    )
+
+    # Save the daily observation.
     supabase_upsert(
         DAILY_TABLE,
-        [row],
+        [latest],
     )
 
+    log.info("Daily PE observation saved successfully.")
+
+    # Rebuild monthly history.
     rebuild_monthly()
 
-    log.info("Daily collection completed successfully")
+    log.info("Daily collection completed successfully.")
 
 
 # ============================================================
