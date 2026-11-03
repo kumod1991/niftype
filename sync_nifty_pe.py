@@ -15,13 +15,8 @@ import yfinance as yf
 # CONFIGURATION
 # ============================================================
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-
-SUPABASE_KEY = (
-    os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    or os.environ.get("SUPABASE_KEY")
-    or ""
-).strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
 
 DAILY_TABLE = "nifty50_pe_daily"
 MONTHLY_TABLE = "nifty50_pe"
@@ -219,6 +214,16 @@ def supabase_upsert(table, rows, conflict="date,ticker"):
             params=params,
             json=batch,
             timeout=REQUEST_TIMEOUT,
+        )
+        log.info("Supabase request URL: %s", response.request.url)
+        log.info(
+            "Prepared request contains apikey: %s",
+            bool(response.request.headers.get("apikey"))
+        )
+        log.info("Final response URL: %s", response.url)
+        log.info(
+            "Redirect history: %s",
+            [r.status_code for r in response.history]
         )
 
         if not response.ok:
